@@ -8,3 +8,6 @@ faiss-cpu
 transformers
 torch
 sentence-transformers
+streamlit
+requests
+
