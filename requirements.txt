@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+langchain
+langchain-community
+faiss-cpu
+transformers
+torch
+sentence-transformers
