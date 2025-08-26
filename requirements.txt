@@ -1,13 +1,11 @@
-fastapi
-uvicorn
-python-multipart
-python-dotenv
+streamlit==1.28.0
+torch>=2.0.1
+transformers>=4.35.0
+sentencepiece
+faiss-cpu
 langchain
 langchain-community
-faiss-cpu
-transformers
-torch
-sentence-transformers
-streamlit
-requests
+python-docx
+python-dotenv
+
 
