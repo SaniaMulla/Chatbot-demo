@@ -1,170 +1,206 @@
 import os
 import re
+import io
 import shutil
 import tempfile
 import logging
 import streamlit as st
-import torch
 import numpy as np
+import torch
 import faiss
 
-# ------------------- Logging -------------------
+# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ------------------- Globals -------------------
-vectorstore = None  # (FAISS index, original docs)
-full_corpus_text = ""
-embeddings_model = None
-summ_model = None
-summ_tokenizer = None
-qa_model = None
-qa_tokenizer = None
+# ---------- Streamlit page ----------
+st.set_page_config(page_title="📚 AI Chatbot - Document Q&A", layout="centered")
+st.title("📚 AI Chatbot - Document Q&A")
+
+# ---------- Globals in session_state ----------
+if "index" not in st.session_state:
+    st.session_state.index = None        # FAISS index
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []         # parallel list of chunk texts
+if "full_text" not in st.session_state:
+    st.session_state.full_text = ""      # entire document text
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ------------------- Helpers -------------------
-
+# ---------- Small utilities ----------
 def clean_text(t: str) -> str:
-    t = t.replace("\u00ad", "")  
-    t = t.replace("\u200b", "")  
+    t = t.replace("\u00ad", "")      # soft hyphen
+    t = t.replace("\u200b", "")      # zero-width space
     t = t.replace("\r", " ")
     t = t.replace("\n", " ")
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-# ------------------- Model Loading -------------------
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 120):
+    text = text.strip()
+    if not text:
+        return []
+    chunks = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + chunk_size, n)
+        chunk = text[start:end]
+        chunks.append(chunk)
+        if end == n:
+            break
+        start = end - overlap
+        if start < 0:
+            start = 0
+    return chunks
 
-def load_embeddings():
-    global embeddings_model
-    if embeddings_model is None:
-        from sentence_transformers import SentenceTransformer
-        embeddings_model = SentenceTransformer("all-MiniLM-L6-v2")
+# ---------- Cached model loaders ----------
+@st.cache_resource(show_spinner=False)
+def get_embedding_model():
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-def load_models():
-    global summ_model, summ_tokenizer, qa_model, qa_tokenizer, device
-    if summ_model is None:
-        from transformers import BartTokenizer, BartForConditionalGeneration
-        summ_tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
-        summ_model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn").to(device)
-    if qa_model is None:
-        from transformers import AutoTokenizer, T5ForConditionalGeneration
-        qa_tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
-        qa_model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-base").to(device)
+@st.cache_resource(show_spinner=False)
+def get_summarizer():
+    from transformers import BartTokenizer, BartForConditionalGeneration
+    tok = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
+    mdl = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn").to(device)
+    return tok, mdl
 
-# ------------------- Summarization -------------------
+@st.cache_resource(show_spinner=False)
+def get_qa_model():
+    from transformers import AutoTokenizer, T5ForConditionalGeneration
+    tok = AutoTokenizer.from_pretrained("google/flan-t5-base")
+    mdl = T5ForConditionalGeneration.from_pretrained("google/flan-t5-base").to(device)
+    return tok, mdl
 
-def bart_summarize_block(text: str, max_len: int = 380, min_len: int = 120) -> str:
-    inputs = summ_tokenizer.encode(text, return_tensors="pt", max_length=1024, truncation=True).to(device)
-    summary_ids = summ_model.generate(
-        inputs, max_length=max_len, min_length=min_len,
+# ---------- File readers (no LangChain) ----------
+def read_pdf(file_path: str) -> str:
+    from pypdf import PdfReader
+    txt_parts = []
+    reader = PdfReader(file_path)
+    for page in reader.pages:
+        t = page.extract_text() or ""
+        if t.strip():
+            txt_parts.append(t)
+    return "\n".join(txt_parts)
+
+def read_docx(file_path: str) -> str:
+    from docx import Document
+    doc = Document(file_path)
+    paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+    return "\n".join(paras)
+
+def read_txt(file_path: str) -> str:
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+# ---------- Embedding / FAISS ----------
+def build_faiss_index(chunks, embed_model):
+    vecs = embed_model.encode(chunks, show_progress_bar=True)
+    vecs = np.array(vecs).astype("float32")
+    dim = vecs.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(vecs)
+    return index
+
+def search_chunks(question: str, k: int = 5):
+    if st.session_state.index is None or not st.session_state.chunks:
+        return []
+    embed = get_embedding_model()
+    q_vec = embed.encode([question]).astype("float32")
+    D, I = st.session_state.index.search(q_vec, k)
+    return [st.session_state.chunks[i] for i in I[0] if 0 <= i < len(st.session_state.chunks)]
+
+# ---------- Summarization / QA ----------
+def summarize_text(full_text: str) -> str:
+    if not full_text.strip():
+        return "The document appears to be empty."
+    tok, mdl = get_summarizer()
+    text = clean_text(full_text)
+    inputs = tok.encode(text, return_tensors="pt", max_length=1024, truncation=True).to(device)
+    ids = mdl.generate(
+        inputs,
+        max_length=420, min_length=160,
         length_penalty=2.0, num_beams=6, early_stopping=True, no_repeat_ngram_size=3
     )
-    return summ_tokenizer.decode(summary_ids[0], skip_special_tokens=True).strip()
+    return tok.decode(ids[0], skip_special_tokens=True).strip()
 
-def summarize_long_document(full_text: str) -> str:
-    text = clean_text(full_text)
-    if not text:
-        return "The document appears to be empty."
-    return bart_summarize_block(text, max_len=420, min_len=160)
-
-def format_bullet_summary(summary: str) -> list:
-    sentences = re.split(r'(?<=[.!?]) +', summary)
-    bullets = [f"• {s.strip()}" for s in sentences if s.strip()]
-    return bullets
-
-# ------------------- QA -------------------
-
-def flan_answer_with_context(context: str, question: str) -> str:
+def answer_with_context(context: str, question: str) -> str:
+    qa_tok, qa_mdl = get_qa_model()
     prompt = (
         "You are a helpful assistant. Use ONLY the given context to answer the question. "
         "If the answer cannot be found in the context, say \"I don't know.\" "
         f"\n\nContext:\n{context}\n\nQuestion: {question}\nAnswer:"
     )
-    inputs = qa_tokenizer(prompt, return_tensors="pt", max_length=1024, truncation=True).to(device)
-    outputs = qa_model.generate(
-        **inputs, max_length=256, min_length=32,
+    inputs = qa_tok(prompt, return_tensors="pt", max_length=1024, truncation=True).to(device)
+    ids = qa_mdl.generate(
+        **inputs, max_length=256, min_length=24,
         num_beams=5, early_stopping=True, no_repeat_ngram_size=3, length_penalty=1.2
     )
-    return qa_tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    return qa_tok.decode(ids[0], skip_special_tokens=True).strip()
 
-# ------------------- Streamlit UI -------------------
-st.set_page_config(page_title="📚 AI Chatbot - Document Q&A", layout="centered")
-st.title("📚 AI Chatbot - Document Q&A")
+def bullets(text: str):
+    sents = re.split(r'(?<=[.!?]) +', text)
+    return [f"• {s.strip()}" for s in sents if s.strip()]
 
-# File upload
-uploaded_file = st.file_uploader("Upload PDF, DOCX, or TXT", type=["pdf", "docx", "txt"])
-if uploaded_file is not None:
-    st.info("Loading models and processing document… please wait ⏳")
-    load_embeddings()
-    load_models()
+# ---------- UI: Upload ----------
+uploaded = st.file_uploader("Upload PDF, DOCX, or TXT", type=["pdf", "docx", "txt"])
 
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            file_path = os.path.join(tmpdir, uploaded_file.name)
-            with open(file_path, "wb") as f:
-                shutil.copyfileobj(uploaded_file, f)
+if uploaded is not None:
+    with st.spinner("Loading models and processing document…"):
+        try:
+            # Save to temp and read
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, uploaded.name)
+                with open(path, "wb") as f:
+                    shutil.copyfileobj(uploaded, f)
 
-            ext = uploaded_file.name.lower()
-            if ext.endswith(".pdf"):
-                from langchain_community.document_loaders import PyPDFLoader
-                loader = PyPDFLoader(file_path)
-            elif ext.endswith(".docx"):
-                from langchain_community.document_loaders import Docx2txtLoader
-                loader = Docx2txtLoader(file_path)
-            elif ext.endswith(".txt"):
-                from langchain_community.document_loaders import TextLoader
-                loader = TextLoader(file_path)
-            else:
-                st.error("Unsupported file type")
-                st.stop()
+                name = uploaded.name.lower()
+                if name.endswith(".pdf"):
+                    raw_text = read_pdf(path)
+                elif name.endswith(".docx"):
+                    raw_text = read_docx(path)
+                elif name.endswith(".txt"):
+                    raw_text = read_txt(path)
+                else:
+                    st.error("Unsupported file type")
+                    st.stop()
 
-            docs = loader.load()
-            if not docs:
-                st.error("No readable content found in the file")
-                st.stop()
+            cleaned = clean_text(raw_text)
+            st.session_state.full_text = cleaned
 
-            from langchain.text_splitter import RecursiveCharacterTextSplitter
+            # Chunk + embed + faiss
+            chunks = chunk_text(cleaned, chunk_size=500, overlap=120)
+            st.session_state.chunks = chunks
 
-            full_text_parts = [clean_text(d.page_content) for d in docs if d.page_content and d.page_content.strip()]
-            full_corpus_text = " ".join(full_text_parts).strip()
+            embed = get_embedding_model()
+            st.session_state.index = build_faiss_index(chunks, embed)
 
-            # ---------------- Embeddings + FAISS ----------------
-            doc_texts = [d.page_content for d in docs]
-            doc_vectors = embeddings_model.encode(doc_texts, show_progress_bar=True)
-            vector_dim = doc_vectors.shape[1]
-            index = faiss.IndexFlatL2(vector_dim)
-            index.add(np.array(doc_vectors))
-            vectorstore = (index, docs)  # store index + original docs
+            st.success(f"{uploaded.name} uploaded and indexed successfully.")
+        except Exception as e:
+            st.error(f"Error during upload: {e}")
 
-        st.success(f"{uploaded_file.name} uploaded and indexed successfully.")
-    except Exception as e:
-        st.error(f"Error during upload: {e}")
-
-# Ask question
-question = st.text_input("Ask a question about the uploaded document:")
+# ---------- UI: Question ----------
+question = st.text_input("Ask a question about the uploaded document (or type 'summarize'):")
 
 if question:
-    if vectorstore is None or not full_corpus_text:
+    if st.session_state.index is None or not st.session_state.full_text:
         st.error("Please upload a document first.")
     else:
         try:
-            if "summarize" in question.lower() or "summary" in question.lower():
-                st.info("🧾 Summarizing whole document…")
-                raw_summary = summarize_long_document(full_corpus_text)
-                bullets = format_bullet_summary(raw_summary)
-                st.write("### Summary:")
-                for b in bullets:
+            if "summarize" in question.lower():
+                st.info("🧾 Summarizing the whole document…")
+                summary = summarize_text(st.session_state.full_text)
+                for b in bullets(summary):
                     st.write(b)
             else:
-                st.info("📚 Retrieving context for QA…")
-                query_vec = embeddings_model.encode([question])
-                D, I = vectorstore[0].search(np.array(query_vec), k=5)
-                retrieved_docs = [vectorstore[1][i] for i in I[0]]
-                context = " ".join(clean_text(d.page_content) for d in retrieved_docs)
+                st.info("🔎 Retrieving relevant passages…")
+                top_chunks = search_chunks(question, k=5)
+                context = " ".join(top_chunks)
                 if len(context) > 12000:
                     context = context[:12000]
-
-                answer = flan_answer_with_context(context, question)
+                answer = answer_with_context(context, question)
                 st.write("### Answer:")
                 st.write(answer)
         except Exception as e:
