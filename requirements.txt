@@ -2,10 +2,8 @@ streamlit==1.28.0
 torch>=2.0.1
 transformers>=4.35.0
 sentencepiece
+sentence-transformers
 faiss-cpu
 langchain
-langchain-community
 python-docx
 python-dotenv
-
-
