@@ -5,15 +5,17 @@ import tempfile
 import logging
 import streamlit as st
 import torch
+import numpy as np
+import faiss
 
 # ------------------- Logging -------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ------------------- Globals -------------------
-vectorstore = None
+vectorstore = None  # (FAISS index, original docs)
 full_corpus_text = ""
-embeddings = None
+embeddings_model = None
 summ_model = None
 summ_tokenizer = None
 qa_model = None
@@ -30,11 +32,16 @@ def clean_text(t: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+# ------------------- Model Loading -------------------
+
+def load_embeddings():
+    global embeddings_model
+    if embeddings_model is None:
+        from sentence_transformers import SentenceTransformer
+        embeddings_model = SentenceTransformer("all-MiniLM-L6-v2")
+
 def load_models():
-    global embeddings, summ_model, summ_tokenizer, qa_model, qa_tokenizer, device
-    if embeddings is None:
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    global summ_model, summ_tokenizer, qa_model, qa_tokenizer, device
     if summ_model is None:
         from transformers import BartTokenizer, BartForConditionalGeneration
         summ_tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
@@ -43,6 +50,8 @@ def load_models():
         from transformers import AutoTokenizer, T5ForConditionalGeneration
         qa_tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
         qa_model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-base").to(device)
+
+# ------------------- Summarization -------------------
 
 def bart_summarize_block(text: str, max_len: int = 380, min_len: int = 120) -> str:
     inputs = summ_tokenizer.encode(text, return_tensors="pt", max_length=1024, truncation=True).to(device)
@@ -62,6 +71,8 @@ def format_bullet_summary(summary: str) -> list:
     sentences = re.split(r'(?<=[.!?]) +', summary)
     bullets = [f"• {s.strip()}" for s in sentences if s.strip()]
     return bullets
+
+# ------------------- QA -------------------
 
 def flan_answer_with_context(context: str, question: str) -> str:
     prompt = (
@@ -84,6 +95,7 @@ st.title("📚 AI Chatbot - Document Q&A")
 uploaded_file = st.file_uploader("Upload PDF, DOCX, or TXT", type=["pdf", "docx", "txt"])
 if uploaded_file is not None:
     st.info("Loading models and processing document… please wait ⏳")
+    load_embeddings()
     load_models()
 
     try:
@@ -112,14 +124,17 @@ if uploaded_file is not None:
                 st.stop()
 
             from langchain.text_splitter import RecursiveCharacterTextSplitter
-            from langchain_community.vectorstores import FAISS
 
             full_text_parts = [clean_text(d.page_content) for d in docs if d.page_content and d.page_content.strip()]
             full_corpus_text = " ".join(full_text_parts).strip()
 
-            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=120)
-            split_docs = splitter.split_documents(docs)
-            vectorstore = FAISS.from_documents(split_docs, embeddings)
+            # ---------------- Embeddings + FAISS ----------------
+            doc_texts = [d.page_content for d in docs]
+            doc_vectors = embeddings_model.encode(doc_texts, show_progress_bar=True)
+            vector_dim = doc_vectors.shape[1]
+            index = faiss.IndexFlatL2(vector_dim)
+            index.add(np.array(doc_vectors))
+            vectorstore = (index, docs)  # store index + original docs
 
         st.success(f"{uploaded_file.name} uploaded and indexed successfully.")
     except Exception as e:
@@ -142,16 +157,15 @@ if question:
                     st.write(b)
             else:
                 st.info("📚 Retrieving context for QA…")
-                docs = vectorstore.similarity_search(question, k=5)
-                if not docs:
-                    st.write("I don't know.")
-                else:
-                    context = " ".join(clean_text(d.page_content) for d in docs)
-                    if len(context) > 12000:
-                        context = context[:12000]
+                query_vec = embeddings_model.encode([question])
+                D, I = vectorstore[0].search(np.array(query_vec), k=5)
+                retrieved_docs = [vectorstore[1][i] for i in I[0]]
+                context = " ".join(clean_text(d.page_content) for d in retrieved_docs)
+                if len(context) > 12000:
+                    context = context[:12000]
 
-                    answer = flan_answer_with_context(context, question)
-                    st.write("### Answer:")
-                    st.write(answer)
+                answer = flan_answer_with_context(context, question)
+                st.write("### Answer:")
+                st.write(answer)
         except Exception as e:
             st.error(f"Error during query: {e}")
