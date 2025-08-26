@@ -1,7 +1,117 @@
+import os
+import re
+import shutil
+import tempfile
+import logging
 import streamlit as st
-import requests
+from typing import List
 
-BACKEND_URL = "http://127.0.0.1:8000"
+# LangChain imports
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# Transformers (local inference)
+from transformers import (
+    BartForConditionalGeneration,
+    BartTokenizer,
+    AutoTokenizer,
+    T5ForConditionalGeneration,
+)
+import torch
+
+# ------------------- Logging -------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ------------------- Globals -------------------
+# Embeddings
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# Summarization model (BART)
+logger.info("Loading summarization model: facebook/bart-large-cnn ...")
+summ_tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
+summ_model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")
+
+# QA model (Flan-T5)
+logger.info("Loading QA model: google/flan-t5-base ...")
+qa_tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+qa_model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-base")
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+summ_model.to(device)
+qa_model.to(device)
+
+# Vector store + raw text
+vectorstore = None
+full_corpus_text = ""
+
+# ------------------- Helpers -------------------
+
+def clean_text(t: str) -> str:
+    t = t.replace("\u00ad", "")  
+    t = t.replace("\u200b", "")  
+    t = t.replace("\r", " ")
+    t = t.replace("\n", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def bart_summarize_block(text: str, max_len: int = 380, min_len: int = 120) -> str:
+    inputs = summ_tokenizer.encode(
+        text,
+        return_tensors="pt",
+        max_length=1024,
+        truncation=True
+    ).to(device)
+    summary_ids = summ_model.generate(
+        inputs,
+        max_length=max_len,
+        min_length=min_len,
+        length_penalty=2.0,
+        num_beams=6,
+        early_stopping=True,
+        no_repeat_ngram_size=3,
+    )
+    return summ_tokenizer.decode(summary_ids[0], skip_special_tokens=True).strip()
+
+def summarize_long_document(full_text: str) -> str:
+    text = clean_text(full_text)
+    if not text:
+        return "The document appears to be empty."
+    return bart_summarize_block(text, max_len=420, min_len=160)
+
+def format_bullet_summary(summary: str) -> list:
+    sentences = re.split(r'(?<=[.!?]) +', summary)
+    bullets = [f"• {s.strip()}" for s in sentences if s.strip()]
+    return bullets
+
+def flan_answer_with_context(context: str, question: str) -> str:
+    prompt = (
+        "You are a helpful assistant. Use ONLY the given context to answer the question. "
+        "If the answer cannot be found in the context, say \"I don't know.\" "
+        f"\n\nContext:\n{context}\n\nQuestion: {question}\nAnswer:"
+    )
+    inputs = qa_tokenizer(
+        prompt,
+        return_tensors="pt",
+        max_length=1024,
+        truncation=True
+    ).to(device)
+
+    outputs = qa_model.generate(
+        **inputs,
+        max_length=256,
+        min_length=32,
+        num_beams=5,
+        early_stopping=True,
+        no_repeat_ngram_size=3,
+        length_penalty=1.2,
+    )
+    answer = qa_tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    return answer
+
+# ------------------- Streamlit UI -------------------
 
 st.set_page_config(page_title="📚 AI Chatbot - Document Q&A", layout="centered")
 st.title("📚 AI Chatbot - Document Q&A")
@@ -9,33 +119,66 @@ st.title("📚 AI Chatbot - Document Q&A")
 # File upload
 uploaded_file = st.file_uploader("Upload PDF, DOCX, or TXT", type=["pdf", "docx", "txt"])
 if uploaded_file is not None:
-    uploaded_file.seek(0)
-    files = {"file": (uploaded_file.name, uploaded_file, uploaded_file.type)}
     try:
-        response = requests.post(f"{BACKEND_URL}/upload/", files=files)
-        if response.status_code == 200:
-            st.success(response.json().get("message"))
-        else:
-            st.error(f"{response.status_code} - {response.json().get('detail')}")
-    except requests.exceptions.RequestException as e:
-        st.error(f"Connection Error: {e}")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = os.path.join(tmpdir, uploaded_file.name)
+            with open(file_path, "wb") as f:
+                shutil.copyfileobj(uploaded_file, f)
 
-# Ask question (triggers on Enter)
+            ext = uploaded_file.name.lower()
+            if ext.endswith(".pdf"):
+                loader = PyPDFLoader(file_path)
+            elif ext.endswith(".docx"):
+                loader = Docx2txtLoader(file_path)
+            elif ext.endswith(".txt"):
+                loader = TextLoader(file_path)
+            else:
+                st.error("Unsupported file type")
+                st.stop()
+
+            docs = loader.load()
+            if not docs:
+                st.error("No readable content found in the file")
+                st.stop()
+
+            full_text_parts = [clean_text(d.page_content) for d in docs if d.page_content and d.page_content.strip()]
+            full_corpus_text = " ".join(full_text_parts).strip()
+
+            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=120)
+            split_docs = splitter.split_documents(docs)
+            vectorstore = FAISS.from_documents(split_docs, embeddings)
+
+        st.success(f"{uploaded_file.name} uploaded and indexed successfully.")
+    except Exception as e:
+        st.error(f"Error during upload: {e}")
+
+# Ask question
 question = st.text_input("Ask a question about the uploaded document:")
 
-if question: 
-    try:
-        response = requests.post(f"{BACKEND_URL}/query/", data={"question": question})
-        if response.status_code == 200:
-            answer = response.json()["answer"]
-
-            st.write("### Answer:")
-            if isinstance(answer, list):  
-                for point in answer:
-                    st.write(point)
+if question:
+    if vectorstore is None or not full_corpus_text:
+        st.error("Please upload a document first.")
+    else:
+        try:
+            if "summarize" in question.lower() or "summary" in question.lower():
+                st.info("🧾 Summarizing whole document...")
+                raw_summary = summarize_long_document(full_corpus_text)
+                bullets = format_bullet_summary(raw_summary)
+                st.write("### Summary:")
+                for b in bullets:
+                    st.write(b)
             else:
-                st.write(answer)
-        else:
-            st.error("Error: " + response.text)
-    except requests.exceptions.RequestException as e:
-        st.error(f"Connection Error: {e}")
+                st.info("📚 Retrieving context for QA...")
+                docs = vectorstore.similarity_search(question, k=5)
+                if not docs:
+                    st.write("I don't know.")
+                else:
+                    context = " ".join(clean_text(d.page_content) for d in docs)
+                    if len(context) > 12000:
+                        context = context[:12000]
+
+                    answer = flan_answer_with_context(context, question)
+                    st.write("### Answer:")
+                    st.write(answer)
+        except Exception as e:
+            st.error(f"Error during query: {e}")
