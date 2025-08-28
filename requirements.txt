@@ -1,10 +1,24 @@
-langchain==0.2.14
-langchain-community==0.2.12
-faiss-cpu==1.7.4
-transformers==4.44.2
-torch==2.4.0
-sentence-transformers==3.0.1
-pypdf==4.2.0
-python-docx==0.8.11
-streamlit==1.37.1
-requests==2.32.3
+# FastAPI backend
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+
+# LangChain + FAISS + Embeddings
+langchain
+langchain-community
+faiss-cpu
+sentence-transformers
+
+# Document loaders
+pypdf
+python-docx
+
+# Transformers for summarization + QA
+transformers
+torch
+accelerate
+
+# Frontend (Streamlit)
+streamlit
+requests
